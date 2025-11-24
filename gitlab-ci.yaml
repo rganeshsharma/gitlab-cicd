@@ -1,0 +1,219 @@
+# .gitlab-ci.yml - Complete pipeline for RKE2 + Harbor
+
+include:
+  - template: Security/SAST.gitlab-ci.yml
+  - template: Security/Dependency-Scanning.gitlab-ci.yml
+  - template: Security/Secret-Detection.gitlab-ci.yml
+  - template: Security/Container-Scanning.gitlab-ci.yml
+
+stages:
+  - build
+  - test
+  - security
+  - deploy-staging
+  - deploy-production
+
+variables:
+  # Harbor registry configuration
+  HARBOR_REGISTRY: "harbor.example.com"
+  HARBOR_PROJECT: "myproject"
+  IMAGE_NAME: "${HARBOR_REGISTRY}/${HARBOR_PROJECT}/${CI_PROJECT_NAME}"
+  IMAGE_TAG: "${CI_COMMIT_SHORT_SHA}"
+  
+  # Docker configuration
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: "/certs"
+  
+  # Kubernetes configuration
+  KUBECTL_VERSION: "1.28.0"
+
+# ============================================
+# STAGE 1: BUILD
+# ============================================
+
+build-docker-image:
+  stage: build
+  image: docker:24-dind
+  services:
+    - docker:24-dind
+  before_script:
+    # Login to Harbor
+    - echo "$HARBOR_PASSWORD" | docker login $HARBOR_REGISTRY -u $HARBOR_USERNAME --password-stdin
+  script:
+    - echo "🔨 Building Docker image..."
+    - docker build -t ${IMAGE_NAME}:${IMAGE_TAG} -t ${IMAGE_NAME}:latest .
+    
+    - echo "📤 Pushing to Harbor..."
+    - docker push ${IMAGE_NAME}:${IMAGE_TAG}
+    - docker push ${IMAGE_NAME}:latest
+    
+    - echo "✅ Image pushed: ${IMAGE_NAME}:${IMAGE_TAG}"
+  after_script:
+    - docker logout $HARBOR_REGISTRY
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "main"'
+
+# ============================================
+# STAGE 2: TEST
+# ============================================
+
+unit-tests:
+  stage: test
+  image: golang:1.21  # or python:3.11 for Python projects
+  script:
+    - echo "🧪 Running unit tests..."
+    - go mod download
+    - go test -v -cover -coverprofile=coverage.out ./...
+    - go tool cover -func=coverage.out
+  coverage: '/coverage: \d+.\d+% of statements/'
+  artifacts:
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage.xml
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "main"'
+
+integration-tests:
+  stage: test
+  image: golang:1.21
+  services:
+    - postgres:15
+    - redis:7
+  variables:
+    POSTGRES_DB: test_db
+    POSTGRES_USER: test_user
+    POSTGRES_PASSWORD: test_pass
+  script:
+    - echo "🔗 Running integration tests..."
+    - go test -v -tags=integration ./...
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "main"'
+
+# ============================================
+# STAGE 3: SECURITY (Runs automatically via templates)
+# ============================================
+
+# Container scanning for Harbor image
+container-scanning:
+  stage: security
+  variables:
+    CS_IMAGE: "${IMAGE_NAME}:${IMAGE_TAG}"
+    CS_REGISTRY_USER: "$HARBOR_USERNAME"
+    CS_REGISTRY_PASSWORD: "$HARBOR_PASSWORD"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop" || $CI_COMMIT_BRANCH == "main"'
+
+# ============================================
+# STAGE 4: DEPLOY TO STAGING (RKE2)
+# ============================================
+
+deploy-staging:
+  stage: deploy-staging
+  image: bitnami/kubectl:${KUBECTL_VERSION}
+  before_script:
+    # Setup kubectl for RKE2 staging cluster
+    - mkdir -p ~/.kube
+    - echo "$KUBECONFIG_STAGING" | base64 -d > ~/.kube/config
+    - chmod 600 ~/.kube/config
+    - kubectl version --client
+    - kubectl cluster-info
+  script:
+    - echo "🚀 Deploying to RKE2 Staging Cluster..."
+    - echo "Image: ${IMAGE_NAME}:${IMAGE_TAG}"
+    
+    # Update deployment with new image
+    - kubectl set image deployment/${CI_PROJECT_NAME} 
+        ${CI_PROJECT_NAME}=${IMAGE_NAME}:${IMAGE_TAG} 
+        -n staging
+    
+    # Wait for rollout to complete
+    - kubectl rollout status deployment/${CI_PROJECT_NAME} -n staging --timeout=5m
+    
+    # Verify deployment
+    - kubectl get pods -n staging -l app=${CI_PROJECT_NAME}
+    
+    - echo "✅ Staging deployment successful!"
+  environment:
+    name: staging
+    url: https://staging.example.com
+    kubernetes:
+      namespace: staging
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+  retry:
+    max: 2
+    when:
+      - runner_system_failure
+      - stuck_or_timeout_failure
+
+# ============================================
+# STAGE 5: DEPLOY TO PRODUCTION (RKE2)
+# ============================================
+
+deploy-production:
+  stage: deploy-production
+  image: bitnami/kubectl:${KUBECTL_VERSION}
+  before_script:
+    # Setup kubectl for RKE2 production cluster
+    - mkdir -p ~/.kube
+    - echo "$KUBECONFIG_PRODUCTION" | base64 -d > ~/.kube/config
+    - chmod 600 ~/.kube/config
+    - kubectl version --client
+    - kubectl cluster-info
+  script:
+    - echo "🚀 Deploying to RKE2 Production Cluster..."
+    - echo "Image: ${IMAGE_NAME}:${IMAGE_TAG}"
+    
+    # Production deployment with extra safety
+    - kubectl set image deployment/${CI_PROJECT_NAME} 
+        ${CI_PROJECT_NAME}=${IMAGE_NAME}:${IMAGE_TAG} 
+        -n production
+    
+    # Wait for rollout with longer timeout
+    - kubectl rollout status deployment/${CI_PROJECT_NAME} -n production --timeout=10m
+    
+    # Verify deployment health
+    - kubectl get pods -n production -l app=${CI_PROJECT_NAME}
+    - kubectl get svc -n production -l app=${CI_PROJECT_NAME}
+    
+    # Optional: Run smoke tests
+    - echo "Running post-deployment smoke tests..."
+    # - curl -f https://prod.example.com/health || exit 1
+    
+    - echo "✅ Production deployment successful!"
+  environment:
+    name: production
+    url: https://example.com
+    kubernetes:
+      namespace: production
+    on_stop: rollback-production
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: manual  # Require manual approval for production
+  retry:
+    max: 1
+    when:
+      - runner_system_failure
+
+# Rollback job (optional but recommended)
+rollback-production:
+  stage: deploy-production
+  image: bitnami/kubectl:${KUBECTL_VERSION}
+  before_script:
+    - mkdir -p ~/.kube
+    - echo "$KUBECONFIG_PRODUCTION" | base64 -d > ~/.kube/config
+  script:
+    - echo "⏪ Rolling back production deployment..."
+    - kubectl rollout undo deployment/${CI_PROJECT_NAME} -n production
+    - kubectl rollout status deployment/${CI_PROJECT_NAME} -n production
+    - echo "✅ Rollback complete!"
+  environment:
+    name: production
+    action: stop
+  when: manual
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+```
+
+---
